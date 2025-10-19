@@ -60,14 +60,13 @@ static retro_system_av_info av_info;
 static enum DBP_State : Bit8u { DBPSTATE_BOOT, DBPSTATE_EXITED, DBPSTATE_SHUTDOWN, DBPSTATE_REBOOT, DBPSTATE_FIRST_FRAME, DBPSTATE_RUNNING } dbp_state;
 static enum DBP_SerializeMode : Bit8u { DBPSERIALIZE_STATES, DBPSERIALIZE_REWIND, DBPSERIALIZE_DISABLED } dbp_serializemode;
 static bool dbp_game_running, dbp_pause_events, dbp_paused_midframe, dbp_frame_pending, dbp_biosreboot, dbp_system_cached, dbp_system_scannable, dbp_refresh_memmaps;
-static bool dbp_optionsupdatecallback, dbp_reboot_set64mem, dbp_use_network, dbp_had_game_running, dbp_strict_mode, dbp_legacy_save, dbp_swapstereo;
-static char dbp_menu_time, dbp_conf_loading, dbp_reboot_machine;
+static bool dbp_optionsupdatecallback, dbp_reboot_set64mem, dbp_use_network, dbp_had_game_running, dbp_strict_mode, dbp_legacy_save, dbp_wasloaded, dbp_skip_c_mount;
+static signed char dbp_menu_time, dbp_conf_loading, dbp_reboot_machine;
 static Bit8u dbp_alphablend_base;
-static float dbp_auto_target, dbp_targetrefreshrate, dbp_last_fastforward;
+static float dbp_auto_target, dbp_last_fastforward;
 static Bit32u dbp_lastmenuticks, dbp_framecount, dbp_emu_waiting, dbp_paused_work;
 static Semaphore semDoContinue, semDidPause;
 static retro_throttle_state dbp_throttle;
-static retro_time_t dbp_lastrun;
 static std::string dbp_crash_message;
 static std::string dbp_content_path;
 static std::string dbp_content_name;
@@ -79,8 +78,10 @@ static Bit16s dbp_content_year, dbp_forcefps;
 static Bit8u buffer_active, dbp_overscan;
 static bool dbp_doublescan, dbp_padding;
 static struct DBP_Buffer { Bit32u *video, width, height, cap, pad_x, pad_y, border_color; float ratio; } dbp_buffers[3];
-enum { DBP_MAX_SAMPLES = 4096 }; // twice amount of mixer blocksize (96khz @ 30 fps max)
-static int16_t dbp_audio[DBP_MAX_SAMPLES * 2]; // stereo
+#ifndef DBP_STANDALONE
+static struct DBP_Audio { int16_t* audio; Bit32u length; } dbp_audio[2];
+static Bit8u dbp_audio_active;
+#endif
 static double dbp_audio_remain;
 static struct retro_hw_render_callback dbp_hw_render;
 static void (*dbp_opengl_draw)(const DBP_Buffer& buf);
@@ -137,7 +138,7 @@ enum DBP_Event_Type : Bit8u
 	DBPET_JOY1DOWN, DBPET_JOY1UP,
 	DBPET_JOY2DOWN, DBPET_JOY2UP,
 	DBPET_KEYDOWN, DBPET_KEYUP,
-	DBPET_ONSCREENKEYBOARD, DBPET_ONSCREENKEYBOARDUP,
+	DBPET_TOGGLEOSD, DBPET_TOGGLEOSDUP,
 	DBPET_ACTIONWHEEL, DBPET_ACTIONWHEELUP,
 	DBPET_SHIFTPORT, DBPET_SHIFTPORTUP,
 
@@ -182,16 +183,16 @@ static const struct DBP_SpecialMapping { int16_t evt, meta; const char *dev, *na
 	{ DBPET_JOY2Y,          1, DBPDEV_Joystick, "Joy 2 Down",   "joy_2_down"         }, // 222
 	{ DBPET_JOY2X,         -1, DBPDEV_Joystick, "Joy 2 Left",   "joy_2_left"         }, // 223
 	{ DBPET_JOY2X,          1, DBPDEV_Joystick, "Joy 2 Right",  "joy_2_right"        }, // 224
-	{ DBPET_ONSCREENKEYBOARD, 0, NULL, "On Screen Keyboard"    }, // 225
-	{ DBPET_ACTIONWHEEL,      0, NULL, "Action Wheel", "wheel" }, // 226
-	{ DBPET_SHIFTPORT,        0, NULL, "Port #1 while holding" }, // 227
-	{ DBPET_SHIFTPORT,        1, NULL, "Port #2 while holding" }, // 228
-	{ DBPET_SHIFTPORT,        2, NULL, "Port #3 while holding" }, // 229
-	{ DBPET_SHIFTPORT,        3, NULL, "Port #4 while holding" }, // 230
+	{ DBPET_TOGGLEOSD,      0, NULL, "Open Menu / Keyboard"  }, // 225
+	{ DBPET_ACTIONWHEEL,    0, NULL, "Action Wheel", "wheel" }, // 226
+	{ DBPET_SHIFTPORT,      0, NULL, "Port #1 while holding" }, // 227
+	{ DBPET_SHIFTPORT,      1, NULL, "Port #2 while holding" }, // 228
+	{ DBPET_SHIFTPORT,      2, NULL, "Port #3 while holding" }, // 229
+	{ DBPET_SHIFTPORT,      3, NULL, "Port #4 while holding" }, // 230
 };
 #define DBP_SPECIALMAPPING(key) DBP_SpecialMappings[(key)-DBP_SPECIALMAPPINGS_KEY]
 enum { DBP_SPECIALMAPPINGS_KEY = 200, DBP_SPECIALMAPPINGS_MAX = 200+(sizeof(DBP_SpecialMappings)/sizeof(DBP_SpecialMappings[0])) };
-enum { DBP_SPECIALMAPPINGS_OSK = 225, DBP_SPECIALMAPPINGS_ACTIONWHEEL = 226 };
+enum { DBP_SPECIALMAPPINGS_OSD = 225, DBP_SPECIALMAPPINGS_ACTIONWHEEL = 226 };
 enum { DBP_EVENT_QUEUE_SIZE = 256, DBP_DOWN_COUNT_MASK = 127, DBP_DOWN_BY_KEYBOARD = 128 };
 static struct DBP_Event { DBP_Event_Type type; Bit8u port; int val, val2; } dbp_event_queue[DBP_EVENT_QUEUE_SIZE];
 static int dbp_event_queue_write_cursor;
@@ -247,7 +248,7 @@ static Bit32u dbp_wait_pause, dbp_wait_finish, dbp_wait_paused, dbp_wait_continu
 // PERF FPS COUNTERS
 //#define DBP_ENABLE_FPS_COUNTERS
 #ifdef DBP_ENABLE_FPS_COUNTERS
-static Bit32u dbp_lastfpstick, dbp_fpscount_retro, dbp_fpscount_gfxstart, dbp_fpscount_gfxend, dbp_fpscount_event;
+static Bit32u dbp_lastfpstick, dbp_fpscount_retro, dbp_fpscount_gfxstart, dbp_fpscount_gfxend, dbp_fpscount_event, dbp_fpscount_skip_run, dbp_fpscount_skip_render;
 #define DBP_FPSCOUNT(DBP_FPSCOUNT_VARNAME) DBP_FPSCOUNT_VARNAME++;
 #else
 #define DBP_FPSCOUNT(DBP_FPSCOUNT_VARNAME)
@@ -322,6 +323,7 @@ void IDE_SetupControllers(char force_cd_drive_letter = 0);
 void NET_SetupEthernet();
 bool MIDI_TSF_SwitchSF(const char*);
 const char* DBP_MIDI_StartupError(Section* midisec, const char*& arg);
+static void DBP_ForceReset(bool forcemenu = false);
 
 static void DBP_QueueEvent(DBP_Event_Type type, Bit8u port, int val = 0, int val2 = 0)
 {
@@ -330,20 +332,20 @@ static void DBP_QueueEvent(DBP_Event_Type type, Bit8u port, int val = 0, int val
 	{
 		case DBPET_KEYDOWN: DBP_ASSERT(val > KBD_NONE && val < KBD_LAST); goto check_down;
 		case DBPET_KEYUP:   DBP_ASSERT(val > KBD_NONE && val < KBD_LAST); goto check_up;
-		case DBPET_MOUSEDOWN:          DBP_ASSERT(val >= 0 && val < 3); downs += KBD_LAST +  0; goto check_down;
-		case DBPET_MOUSEUP:            DBP_ASSERT(val >= 0 && val < 3); downs += KBD_LAST +  0; goto check_up;
-		case DBPET_JOY1DOWN:           DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  3; goto check_down;
-		case DBPET_JOY1UP:             DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  3; goto check_up;
-		case DBPET_JOY2DOWN:           DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  5; goto check_down;
-		case DBPET_JOY2UP:             DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  5; goto check_up;
-		case DBPET_JOYHATSETBIT:       DBP_ASSERT(val >= 0 && val < 8); downs += KBD_LAST +  7; goto check_down;
-		case DBPET_JOYHATUNSETBIT:     DBP_ASSERT(val >= 0 && val < 8); downs += KBD_LAST +  7; goto check_up;
-		case DBPET_ONSCREENKEYBOARD:   DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 15; goto check_down;
-		case DBPET_ONSCREENKEYBOARDUP: DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 15; goto check_up;
-		case DBPET_ACTIONWHEEL:        DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 16; goto check_down;
-		case DBPET_ACTIONWHEELUP:      DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 16; goto check_up;
-		case DBPET_SHIFTPORT:          DBP_ASSERT(val >= 0 && val < 4); downs += KBD_LAST + 17; goto check_down;
-		case DBPET_SHIFTPORTUP:        DBP_ASSERT(val >= 0 && val < 4); downs += KBD_LAST + 17; goto check_up;
+		case DBPET_MOUSEDOWN:      DBP_ASSERT(val >= 0 && val < 3); downs += KBD_LAST +  0; goto check_down;
+		case DBPET_MOUSEUP:        DBP_ASSERT(val >= 0 && val < 3); downs += KBD_LAST +  0; goto check_up;
+		case DBPET_JOY1DOWN:       DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  3; goto check_down;
+		case DBPET_JOY1UP:         DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  3; goto check_up;
+		case DBPET_JOY2DOWN:       DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  5; goto check_down;
+		case DBPET_JOY2UP:         DBP_ASSERT(val >= 0 && val < 2); downs += KBD_LAST +  5; goto check_up;
+		case DBPET_JOYHATSETBIT:   DBP_ASSERT(val >= 0 && val < 8); downs += KBD_LAST +  7; goto check_down;
+		case DBPET_JOYHATUNSETBIT: DBP_ASSERT(val >= 0 && val < 8); downs += KBD_LAST +  7; goto check_up;
+		case DBPET_TOGGLEOSD:      DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 15; goto check_down;
+		case DBPET_TOGGLEOSDUP:    DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 15; goto check_up;
+		case DBPET_ACTIONWHEEL:    DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 16; goto check_down;
+		case DBPET_ACTIONWHEELUP:  DBP_ASSERT(val >= 0 && val < 1); downs += KBD_LAST + 16; goto check_up;
+		case DBPET_SHIFTPORT:      DBP_ASSERT(val >= 0 && val < 4); downs += KBD_LAST + 17; goto check_down;
+		case DBPET_SHIFTPORTUP:    DBP_ASSERT(val >= 0 && val < 4); downs += KBD_LAST + 17; goto check_up;
 
 		check_down:
 			if (((++downs[val]) & DBP_DOWN_COUNT_MASK) > 1) return;
@@ -428,7 +430,7 @@ static void DBP_ReleaseKeyEvents(bool onlyPhysicalKeys)
 		else if (i < KBD_LAST +  5) { val -=  KBD_LAST +  3; type = DBPET_JOY1UP; }
 		else if (i < KBD_LAST +  7) { val -=  KBD_LAST +  5; type = DBPET_JOY2UP; }
 		else if (i < KBD_LAST + 15) { val -=  KBD_LAST +  7; type = DBPET_JOYHATUNSETBIT; }
-		else if (i < KBD_LAST + 16) { val -=  KBD_LAST + 15; type = DBPET_ONSCREENKEYBOARDUP; }
+		else if (i < KBD_LAST + 16) { val -=  KBD_LAST + 15; type = DBPET_TOGGLEOSDUP; }
 		else if (i < KBD_LAST + 17) { val -=  KBD_LAST + 16; type = DBPET_ACTIONWHEELUP; }
 		else                        { val -=  KBD_LAST + 17; type = DBPET_SHIFTPORTUP; }
 		DBP_QueueEvent(type, DBP_NO_PORT, val);
@@ -483,7 +485,7 @@ static void DBP_ReportCoreMemoryMaps()
 	// [GAME] [OS] [EXPANDED MEMORY] so regardless of the size of the OS environment
 	// the game memory (below 640k) is always at the same (virtual) address.
 
-	struct retro_memory_descriptor mdescs[3] = { 0 }, *mdesc_expandedmem;
+	struct retro_memory_descriptor mdescs[3] = {{0}}, *mdesc_expandedmem;
 	if (!booted_os)
 	{
 		Bit16u seg_prog_start = (DOS_MEM_START + 2 + 5); // see mcb_sizes in DOS_SetupMemory
@@ -599,6 +601,7 @@ static void DBP_ThreadControl(DBP_ThreadCtlMode m)
 			return;
 		case TCM_ON_SHUTDOWN:
 			dbp_state = DBPSTATE_EXITED;
+			dbp_game_running = false;
 			semDidPause.Post();
 			return;
 		case_TCM_EMULATION_PAUSED:
@@ -626,16 +629,8 @@ static void DBP_SetCyclesByYear(int year, int year_max)
 {
 	DBP_ASSERT(year > 1970);
 	CPU_CycleMax = DBP_CyclesForYear(year, year_max);
-
-	// Also switch to dynamic core for newer real mode games
-	if (year >= 1990 && (CPU_AutoDetermineMode & CPU_AUTODETERMINE_CORE))
-	{
-		#if (C_DYNAMIC_X86)
-		if (cpudecoder != CPU_Core_Dyn_X86_Run) { void CPU_Core_Dyn_X86_Cache_Init(bool); CPU_Core_Dyn_X86_Cache_Init(true); cpudecoder = CPU_Core_Dyn_X86_Run; }
-		#elif (C_DYNREC)
-		if (cpudecoder != CPU_Core_Dynrec_Run)  { void CPU_Core_Dynrec_Cache_Init(bool);  CPU_Core_Dynrec_Cache_Init(true);  cpudecoder = CPU_Core_Dynrec_Run;  }
-		#endif
-	}
+	extern void DBP_CPU_AutoEnableDynamicCore();
+	DBP_CPU_AutoEnableDynamicCore();
 }
 
 void DBP_SetRealModeCycles()
@@ -649,18 +644,30 @@ void DBP_SetRealModeCycles()
 		CPU_CycleAutoAdjust = true;
 }
 
-static bool DBP_NeedFrameSkip(bool in_emulation)
+static int DBP_NeedFrameSkip(bool in_emulation)
 {
-	if ((in_emulation ? (dbp_throttle.rate > render.src.fps - 1) : (render.src.fps > dbp_throttle.rate - 1))
-		|| dbp_throttle.rate < 10
-		|| dbp_throttle.mode == RETRO_THROTTLE_FRAME_STEPPING || dbp_throttle.mode == RETRO_THROTTLE_FAST_FORWARD
-		|| dbp_throttle.mode == RETRO_THROTTLE_SLOW_MOTION || dbp_throttle.mode == RETRO_THROTTLE_REWINDING) return false;
+	float run_rate = dbp_throttle.rate, emu_rate = render.src.fps;
+	if (run_rate == 0)
+	{
+		if (dbp_throttle.mode == RETRO_THROTTLE_FAST_FORWARD) return (in_emulation ? 8 : 0);
+		run_rate = (float)av_info.timing.fps;
+	}
+	else if (dbp_throttle.mode == RETRO_THROTTLE_FAST_FORWARD || dbp_throttle.mode == RETRO_THROTTLE_SLOW_MOTION || dbp_throttle.mode == RETRO_THROTTLE_REWINDING)
+	{
+		emu_rate *= (run_rate / (float)av_info.timing.fps);
+	}
+
+	if ((in_emulation ? (run_rate >= emu_rate - 0.001f) : (emu_rate >= run_rate - 0.001f)) || run_rate < 5 || emu_rate < 5 || dbp_throttle.mode == RETRO_THROTTLE_FRAME_STEPPING) return 0;
 	static float accum;
-	accum += (in_emulation ? (render.src.fps - dbp_throttle.rate) : (dbp_throttle.rate - render.src.fps));
-	if (accum < dbp_throttle.rate) return false;
-	//log_cb(RETRO_LOG_INFO, "%s AT %u\n", (in_emulation ? "[GFX_EndUpdate] EMULATING TWO FRAMES" : "[retro_run] SKIP EMULATING FRAME"), dbp_framecount);
-	accum -= dbp_throttle.rate;
-	return true;
+	accum += (in_emulation ? (emu_rate - run_rate) : (run_rate - emu_rate));
+	if (accum < run_rate) return 0;
+	int res = (in_emulation ? (int)(accum / run_rate) : 1);
+	#ifdef DBP_ENABLE_FPS_COUNTERS
+	(in_emulation ? dbp_fpscount_skip_render : dbp_fpscount_skip_run) += (Bit32u)res;
+	#endif
+	//log_cb(RETRO_LOG_INFO, "%s %d FRAME(S) AT %u\n", (in_emulation ? "[GFX_EndUpdate] SKIP RENDERING" : "[retro_run] SKIP EMULATING"), res, dbp_framecount);
+	accum -= run_rate * res;
+	return res;
 }
 
 bool DBP_Image_IsCD(const DBP_Image& image)
@@ -785,7 +792,7 @@ void DBP_Unmount(char drive)
 	mem_writeb(Real2Phys(dos.tables.mediaid)+(drive-'A')*9,0);
 
 	// Unmount anything that is a subst mirror of the drive that just got unmounted
-	for (Bit8u i = 0; i < DOS_DRIVES; i++)
+	for (Bit8u i = 0; drv && i < DOS_DRIVES; i++)
 		if ((tst = Drives[i]) != NULL && tst != drv && tst->GetShadow(0, false) == drv)
 			DBP_Unmount(i + 'A');
 }
@@ -814,7 +821,7 @@ static std::string DBP_GetSaveFile(DBP_SaveFileType type, const char** out_filen
 			}
 			dos.dta(save_dta);
 		}
-		if (type == SFT_SAVENAMEREDIRECT && !savenamelen) return std::move(res);
+		if (type == SFT_SAVENAMEREDIRECT && !savenamelen) return res;
 	}
 	const char *env_dir = NULL;
 	if (environ_cb((type < _SFT_LAST_SAVE_DIRECTORY ? RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY : RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY), &env_dir) && env_dir)
@@ -879,7 +886,7 @@ static std::string DBP_GetSaveFile(DBP_SaveFileType type, const char** out_filen
 		}
 	}
 	if (out_filename) *out_filename = res.c_str() + dir_len;
-	return std::move(res);
+	return res;
 }
 
 FILE* DBP_FileOpenContentOrSystem(const char* fname)
@@ -906,6 +913,19 @@ static void DBP_SetDriveLabelFromContentPath(DOS_Drive* drive, const char *path,
 		safe_strncpy(lblend + 1, ext, (lbl+11-lblend));
 	}
 	drive->label.SetLabel(lbl, (letter > 'C'), true);
+}
+
+static bool DBP_IsDiskCDISO(imageDisk* id)
+{
+	// Check if ISO (based on CDROM_Interface_Image::LoadIsoFile/CDROM_Interface_Image::CanReadPVD)
+	static const Bit32u pvdoffsets[] = { 32768, 32768+8, 37400, 37400+8, 37648, 37656, 37656+8 };
+	for (Bit32u pvdoffset : pvdoffsets)
+	{
+		Bit8u pvd[8];
+		if (id->Read_Raw(pvd, pvdoffset, 8) == 8 && (!memcmp(pvd, "\1CD001\1", 7) || !memcmp(pvd, "\1CDROM\1", 7)))
+			return true;
+	}
+	return false;
 }
 
 static DOS_Drive* DBP_Mount(unsigned image_index = 0, bool unmount_existing = true, char remount_letter = 0, const char* boot = NULL)
@@ -976,14 +996,7 @@ static DOS_Drive* DBP_Mount(unsigned image_index = 0, bool unmount_existing = tr
 		}
 		else if (!fat->created_successfully)
 		{
-			// Check if ISO (based on CDROM_Interface_Image::LoadIsoFile/CDROM_Interface_Image::CanReadPVD)
-			static const Bit32u pvdoffsets[] = { 32768, 32768+8, 37400, 37400+8, 37648, 37656, 37656+8 };
-			for (Bit32u pvdoffset : pvdoffsets)
-			{
-				Bit8u pvd[8];
-				if (fat->loadedDisk->Read_Raw(pvd, pvdoffset, 8) == 8 && (!memcmp(pvd, "\1CD001\1", 7) || !memcmp(pvd, "\1CDROM\1", 7)))
-					goto FAT_TRY_ISO;
-			}
+			if (DBP_IsDiskCDISO(fat->loadedDisk)) goto FAT_TRY_ISO;
 			// Neither FAT nor ISO, just register with BIOS/CMOS for raw sector access and set media table byte
 			disk = fat->loadedDisk;
 			fat->loadedDisk = NULL; // don't want it deleted by ~fatDrive
@@ -1125,16 +1138,14 @@ static DOS_Drive* DBP_Mount(unsigned image_index = 0, bool unmount_existing = tr
 		MSCDEX_AddDrive(letter, "", subUnit);
 	}
 
-	// Register CDROM with IDE controller only when running with 32MB or more RAM (used when booting an operating system)
-	if (cdrom && (MEM_TotalPages() / 256) >= 32)
-	{
-		IDE_RefreshCDROMs();
-	}
+	// Register CDROM with IDE controller (if IDE_SetupControllers was called)
+	if (cdrom) IDE_RefreshCDROMs();
 
 	if (path)
 	{
 		if (boot) dbpimage = &dbp_images[(image_index = DBP_AppendImage(path, false))];
 		dbpimage->mounted = true;
+		dbpimage->remount = false;
 		dbpimage->drive = letter;
 		dbp_image_index = image_index;
 	}
@@ -1212,6 +1223,21 @@ void DBP_ImgMountLoadDisks(char drive, const std::vector<std::string>& paths, bo
 	DBP_Mount(DBP_AppendImage(paths[0].c_str(), false));
 }
 
+void DBPSerialize_Mounts(DBPArchive& ar)
+{
+	const char* fname;
+	Bit32u mounthash[2] = { 0, 0 }; // remember max 2 mounted images (one floppy and cd)
+	if (ar.mode == DBPArchive::MODE_SAVE)
+		for (DBP_Image& i : dbp_images)
+			if (i.mounted && DBP_ExtractPathInfo(i.longpath.c_str(), &fname))
+				mounthash[mounthash[0] ? 1 : 0] = BaseStringToPointerHashMap::Hash(fname);
+	ar << mounthash[0] << mounthash[1];
+	if (ar.mode == DBPArchive::MODE_LOAD && mounthash[0])
+		for (DBP_Image& i : dbp_images)
+			if (DBP_ExtractPathInfo(i.longpath.c_str(), &fname) && (mounthash[0] == BaseStringToPointerHashMap::Hash(fname) || (mounthash[1] && mounthash[1] == BaseStringToPointerHashMap::Hash(fname))))
+				DBP_Mount((unsigned)(&i - &dbp_images[0]), true);
+}
+
 static void DBP_Shutdown()
 {
 	// to be called on the main thread
@@ -1233,20 +1259,13 @@ static void DBP_Shutdown()
 	dbp_state = DBPSTATE_SHUTDOWN;
 }
 
-void DBP_ForceReset()
-{
-	// to be called on the main thread
-	retro_input_state_t tmp = input_state_cb;
-	input_state_cb = NULL;
-	retro_reset();
-	input_state_cb = tmp;
-}
-
 void DBP_OnBIOSReboot()
 {
 	// to be called on the DOSBox thread
+	if ((MEM_TotalPages() / 256) == 64 && atoi(DBP_Option::Get(DBP_Option::memory_size)) < 32)
+		dbp_reboot_set64mem = true; // avoid another restart via DBP_Run::BootOS
 	dbp_biosreboot = true;
-	DBP_DOSBOX_ForceShutdown();
+	if (first_shell) DBP_DOSBOX_ForceShutdown();
 }
 
 static double DBP_GetFPS()
@@ -1259,6 +1278,9 @@ void DBP_Crash(const char* msg)
 {
 	log_cb(RETRO_LOG_WARN, "[DOSBOX] Crash: %s\n", msg);
 	dbp_crash_message = msg;
+	if (!render.src.fps) { render.src = { 640, 0, 480, 32, 0, 0, 4.0/3, 70 }; } // crash before first frame
+	DBP_Buffer& buf = dbp_buffers[buffer_active];
+	if (!buf.video) { buf = { (Bit32u*)calloc(640*480, 4), 640, 480, 640*480*4, 0, 0, 0, 4.0f/3 }; } // crash before first draw
 	DBP_DOSBOX_ForceShutdown();
 }
 
@@ -1351,12 +1373,11 @@ static std::vector<std::string>& DBP_ScanSystem(bool force_midi_scan)
 			}
 			else if (ln > 4 && (!strcasecmp(entry_name + ln - 4, ".IMG") || !strcasecmp(entry_name + ln - 4, ".IMA") || !strcasecmp(entry_name + ln - 4, ".VHD")))
 			{
-				int32_t entry_size = 0;
 				std::string subpath(subdir); subpath.append(subdir.length() ? "/" : "").append(entry_name);
 				FILE* f = fopen_wrap(path.assign(system_dir).append("/").append(subpath).c_str(), "rb");
 				Bit64u fsize = 0; if (f) { fseek_wrap(f, 0, SEEK_END); fsize = (Bit64u)ftell_wrap(f); fclose(f); }
 				if (fsize < 1024*1024*7 || (fsize % 512)) continue; // min 7MB hard disk image made up of 512 byte sectors
-				dbp_osimages.push_back(std::move(subpath));
+				dbp_osimages.emplace_back(std::move(subpath));
 			}
 			else if (ln > 5 && !strcasecmp(entry_name + ln - 5, ".DOSZ"))
 			{
@@ -1409,6 +1430,7 @@ static std::vector<std::string>& DBP_ScanSystem(bool force_midi_scan)
 	return dynstr;
 }
 
+#include "dosbox_pure_ver.h"
 #include "dosbox_pure_pad.h"
 #include "dosbox_pure_run.h"
 #include "dosbox_pure_osd.h"
@@ -1508,7 +1530,7 @@ void GFX_EndUpdate(const Bit16u *changedLines)
 	else
 	{
 		// Use square pixels, if the correct aspect ratio is far off, we double or halve the aspect ratio
-		float sqr_ratio = ((float)srcw / srch), sqr_to_corr = (((srcw<<dblw) / ((srch<<dblh) * (float)render.src.ratio)) / sqr_ratio);
+		float sqr_ratio = ((float)buf.width / buf.height), sqr_to_corr = (((srcw<<dblw) / ((srch<<dblh) * (float)render.src.ratio)) / sqr_ratio);
 		buf.ratio = sqr_ratio * (sqr_to_corr > 1.66f ? 2.0f : (sqr_to_corr > 0.6f ? 1.0f : 0.5f));
 	}
 
@@ -1526,9 +1548,16 @@ void GFX_EndUpdate(const Bit16u *changedLines)
 
 	if (dbp_intercept_next && dbp_intercept_next->usegfx())
 	{
+		#ifdef DBP_STANDALONE
+		DBP_Buffer& osdbf = dbp_osdbuf[(buffer_active + 1) % 3];
+		if (!osdbf.video) osdbf.video = (Bit32u*)malloc(DBPS_OSD_WIDTH*DBPS_OSD_HEIGHT*4);
+		memset(osdbf.video, 0, DBPS_OSD_WIDTH*DBPS_OSD_HEIGHT*4);
+		dbp_intercept_next->gfx(osdbf);
+		#else
 		if (dbp_opengl_draw && voodoo_ogl_is_showing()) // zero all including alpha because we'll blend the OSD after displaying voodoo
 			memset(buf.video, 0, buf.width * buf.height * 4);
 		dbp_intercept_next->gfx(buf);
+		#endif
 		buf.border_color = 0xDEADBEEF; // force redraw
 	}
 
@@ -1544,7 +1573,7 @@ void GFX_EndUpdate(const Bit16u *changedLines)
 
 	// frameskip is best to be modified in this function (otherwise it can be off by one)
 	dbp_framecount += 1 + render.frameskip.max;
-	if (!dbp_last_fastforward) render.frameskip.max = (DBP_NeedFrameSkip(true) ? 1 : 0);
+	render.frameskip.max = DBP_NeedFrameSkip(true);
 
 	// handle frame skipping and CPU speed during fast forwarding
 	const float ffrate = (dbp_throttle.mode != RETRO_THROTTLE_FAST_FORWARD ? 0.0f : (dbp_throttle.rate ? dbp_throttle.rate : -1.0f));
@@ -1556,13 +1585,11 @@ void GFX_EndUpdate(const Bit16u *changedLines)
 		if (!dbp_last_fastforward) { old_max = CPU_CycleMax; old_pmode = cpu.pmode; }
 		if (ffrate > 0 && (dbp_state == DBPSTATE_RUNNING || dbp_state == DBPSTATE_FIRST_FRAME))
 		{
-			// If fast forwarding at a desired rate, apply custom frameskip and max cycle rules
-			render.frameskip.max = (int)(ffrate / av_info.timing.fps * 1.5f + .4f);
+			// If fast forwarding at a desired rate, apply custom max cycle rules
 			CPU_CycleMax = (Bit32s)(old_max / (CPU_CycleAutoAdjust ? ffrate / av_info.timing.fps : 1.0f));
 		}
 		else
 		{
-			render.frameskip.max = 8;
 			CPU_CycleMax = (cpu.pmode ? 30000 : 10000);
 		}
 	}
@@ -1641,9 +1668,6 @@ static bool GFX_AdvanceFrame(bool force_skip, bool force_no_auto_adjust)
 		goto return_true;
 	}
 
-	if (finishedframes > 1)
-		goto return_true;
-
 	if (dbp_throttle.mode == RETRO_THROTTLE_FRAME_STEPPING || dbp_throttle.mode == RETRO_THROTTLE_FAST_FORWARD || dbp_throttle.mode == RETRO_THROTTLE_SLOW_MOTION || dbp_throttle.mode == RETRO_THROTTLE_REWINDING)
 		goto return_true;
 
@@ -1657,7 +1681,10 @@ static bool GFX_AdvanceFrame(bool force_skip, bool force_no_auto_adjust)
 	if ((St.HistoryCursor % HISTORY_STEP) == 0)
 	{
 		float absFrameTime = (1000000.0f / render.src.fps);
-		Bit32u frameTime = (Bit32u)(absFrameTime * (dbp_auto_target - 0.01f));
+		if (dbp_throttle.rate <= render.src.fps - 1)
+			absFrameTime *= render.src.fps / (dbp_throttle.rate + 1);
+
+		Bit32u frameTime = (Bit32u)(absFrameTime * dbp_auto_target);
 
 		Bit32u frameThreshold = 0;
 		for (Bit32u f : St.HistoryFrame) frameThreshold += f;
@@ -1777,8 +1804,8 @@ void GFX_Events()
 				break;
 			case DBPET_KEYUP: KEYBOARD_AddKey((KBD_KEYS)e.val, false); break;
 
-			case DBPET_ONSCREENKEYBOARD: DBP_StartOSD(); break;
-			case DBPET_ONSCREENKEYBOARDUP: break;
+			case DBPET_TOGGLEOSD: DBP_StartOSD(); break;
+			case DBPET_TOGGLEOSDUP: break;
 
 			case DBPET_ACTIONWHEEL: DBP_WheelShiftOSD(e.port, true); break;
 			case DBPET_ACTIONWHEELUP: DBP_WheelShiftOSD(e.port, false); break;
@@ -1788,6 +1815,9 @@ void GFX_Events()
 
 			case DBPET_MOUSEMOVE:
 			{
+				#ifdef DBP_STANDALONE
+				if (dbp_mouse_input != 'p') DBPS_GetMouse(dbp_mouse_x, dbp_mouse_y, false);
+				#endif
 				float mx = e.val*dbp_mouse_speed*dbp_mouse_speed_x, my = e.val2*dbp_mouse_speed; // good for 320x200?
 				Mouse_CursorMoved(mx, my, (dbp_mouse_x+0x7fff)/(float)0xFFFE, (dbp_mouse_y+0x7fff)/(float)0xFFFE, (dbp_mouse_input != 'd'));
 				break;
@@ -1841,6 +1871,13 @@ void GFX_Events()
 			my *= dbp_mouse_speed;
 			Mouse_CursorMoved(mx, my, 0, 0, true);
 		}
+		#ifdef DBP_STANDALONE
+		if (dbps_emu_thread_func)
+		{
+			dbps_emu_thread_func();
+			dbps_emu_thread_func = NULL;
+		}
+		#endif
 	}
 
 	GFX_EVENTS_RECURSIVE = false;
@@ -2031,7 +2068,7 @@ void retro_get_system_info(struct retro_system_info *info) // #1
 {
 	memset(info, 0, sizeof(*info));
 	info->library_name     = "DOSBox-pure";
-	info->library_version  = "1.0-preview1";
+	info->library_version  = DOSBOX_PURE_VERSION_STR;
 	info->need_fullpath    = true;
 	info->block_extract    = true;
 	info->valid_extensions = "zip|dosz|exe|com|bat|iso|chd|cue|ins|img|ima|vhd|jrc|tc|m3u|m3u8|conf|/";
@@ -2056,8 +2093,12 @@ static void set_variables(bool force_midi_scan = false)
 	for (size_t f = 0; f != numfiles; f += 2)
 		if (((&dynstr[f].back())[-1]|0x20) != 'f') // .ROM extension munt rom
 			def.values[i++] = { dynstr[f].c_str(), dynstr[f+1].c_str() };
-	def.values[i++] = { "disabled", "Disabled" };
+	#ifndef DBP_STANDALONE
 	def.values[i++] = { "frontend", "Frontend MIDI driver" };
+	#else
+	def.values[i++] = { "system", "System MIDI driver" };
+	#endif
+	def.values[i++] = { "disabled", "Disabled" };
 	if (dbp_system_cached)
 		def.values[i++] = { "scan", (!strcmp(DBP_Option::Get(DBP_Option::midi), "scan") ? "System directory scan finished" : "Scan System directory for soundfonts (open this menu again after)") };
 	def.values[i] = { 0, 0 };
@@ -2135,19 +2176,14 @@ bool DBP_Option::Apply(Section& section, const char* var_name, const char* new_v
 	if (!strcmp(new_value, (propVal.type == Value::V_STRING ? (const char*)propVal : propVal.ToString().c_str()))) return false;
 
 	bool reInitSection = (dbp_state != DBPSTATE_BOOT);
-	if (disallow_in_game && dbp_game_running)
+	if ((disallow_in_game && dbp_game_running) || (need_restart && reInitSection))
 	{
-		retro_notify(0, RETRO_LOG_WARN, "Unable to change value while game is running");
+		if (disallow_in_game && user_modified)
+			retro_notify(0, RETRO_LOG_WARN, "Unable to change value while game is running");
+		else if ((dbp_game_running || DBP_OSD.ptr._all == NULL || !DBP_FullscreenOSD) && user_modified)
+			retro_notify(2000, RETRO_LOG_INFO, "Setting will be applied after restart");
+		DBP_Run::startup.reboot = true;
 		reInitSection = false;
-	}
-	if (need_restart && reInitSection && dbp_game_running)
-	{
-		retro_notify(2000, RETRO_LOG_INFO, "Setting will be applied after restart");
-		reInitSection = false;
-	}
-	else if (need_restart && reInitSection)
-	{
-		dbp_state = DBPSTATE_REBOOT;
 	}
 
 	//log_cb(RETRO_LOG_INFO, "[DOSBOX] variable %s::%s updated from %s to %s\n", section_name, var_name, old_val.c_str(), new_value);
@@ -2219,6 +2255,15 @@ static bool check_variables()
 	if (environ_cb) environ_cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &options_ver);
 	bool visibility_changed = false;
 
+	#ifdef DBP_STANDALONE
+	int interface_crtfilter = atoi(DBP_Option::Get(DBP_Option::interface_crtfilter));
+	DBP_Option::SetDisplay(DBP_Option::interface_crtscanline, !!interface_crtfilter);
+	DBP_Option::SetDisplay(DBP_Option::interface_crtblur, !!interface_crtfilter);
+	DBP_Option::SetDisplay(DBP_Option::interface_crtmask, !!interface_crtfilter);
+	DBP_Option::SetDisplay(DBP_Option::interface_crtcurvature, !!interface_crtfilter);
+	DBP_Option::SetDisplay(DBP_Option::interface_crtcorner, !!interface_crtfilter);
+	#endif
+
 	dbp_actionwheel_inputs = (Bit8u)atoi(DBP_Option::Get(DBP_Option::actionwheel_inputs));
 	dbp_auto_mapping_mode = DBP_Option::Get(DBP_Option::auto_mapping)[0];
 
@@ -2231,36 +2276,42 @@ static bool check_variables()
 	        &sec_speaker  = *control->GetSection("speaker"),  &sec_cpu = *control->GetSection("cpu"), &sec_render   = *control->GetSection("render"),
 	        &sec_sblaster = *control->GetSection("sblaster"), &sec_gus = *control->GetSection("gus"), &sec_joystick = *control->GetSection("joystick");
 
-	char dbp_mchar = (dbp_reboot_machine ? dbp_reboot_machine : DBP_Option::Get(DBP_Option::machine)[0]);
-	char db_mchar = (control ? *(const char*)control->GetProp("dosbox", "machine")->GetValue() : '\0');
-	int db_mch = (dbp_state != DBPSTATE_BOOT ? machine : -1);
-	bool machine_is_svga = ((db_mch == MCH_VGA && svgaCard != SVGA_None) || db_mchar == 's'), machine_is_cga = (db_mch == MCH_CGA || db_mchar == 'c'), machine_is_hercules = (db_mch == MCH_HERC || db_mchar == 'h');
-	const char* dbmachine;
-	switch (dbp_mchar)
+	bool machine_changed = false;
+	const char new_mchar = (dbp_reboot_machine ? dbp_reboot_machine : DBP_Option::Get(DBP_Option::machine, &machine_changed)[0]), *new_machine = "svga_s3";
+	switch (new_mchar)
 	{
-		case 's': dbmachine = DBP_Option::Get(DBP_Option::svga); machine_is_svga = true; break;
-		case 'v': dbmachine = "vgaonly"; break;
-		case 'e': dbmachine = "ega"; break;
-		case 'c': dbmachine = "cga"; machine_is_cga = true; break;
-		case 't': dbmachine = "tandy"; break;
-		case 'h': dbmachine = "hercules"; machine_is_hercules = true; break;
-		case 'p': dbmachine = "pcjr"; break;
+		case 's': new_machine = DBP_Option::Get(DBP_Option::svga, &machine_changed); break;
+		case 'v': new_machine = "vgaonly"; break;
+		case 'e': new_machine = "ega"; break;
+		case 'c': new_machine = "cga"; break;
+		case 't': new_machine = "tandy"; break;
+		case 'h': new_machine = "hercules"; break;
+		case 'p': new_machine = "pcjr"; break;
 	}
-	visibility_changed |= DBP_Option::Apply(sec_dosbox, "machine", dbmachine, false, true);
-	if (dbp_reboot_machine) dbp_reboot_machine = 0;
+	visibility_changed |= DBP_Option::Apply(sec_dosbox, "machine", new_machine, false, true, machine_changed);
 	DBP_Option::GetAndApply(sec_dosbox, "vmemsize", DBP_Option::svgamem, false, true);
+	if (dbp_reboot_machine) dbp_reboot_machine = 0;
+	const char cur_mchar = (dbp_state == DBPSTATE_BOOT ? '\0' : (machine == MCH_VGA && svgaCard != SVGA_None) ? 's' : machine == MCH_CGA ? 'c' : machine == MCH_HERC ? 'h' : '\0'); // need only these 3
+	const bool show_svga = (new_mchar == 's' || cur_mchar == 's'), show_cga = (new_mchar == 'c' || cur_mchar == 'c'), show_hercules = (new_mchar == 'h' || cur_mchar == 'h');
+	const char active_mchar = (dbp_state == DBPSTATE_BOOT ? new_mchar : cur_mchar);
 
 	bool mem_changed = false;
 	const char* mem = DBP_Option::Get(DBP_Option::memory_size, &mem_changed);
 	if (dbp_reboot_set64mem) mem = "64";
 	bool mem_use_extended = (atoi(mem) > 0);
-	DBP_Option::Apply(sec_dos, "xms", (mem_use_extended ? "true" : "false"), true, false, mem_changed);
-	DBP_Option::Apply(sec_dos, "ems", (mem_use_extended ? "true" : "false"), true, false, mem_changed);
+	DBP_Option::Apply(sec_dos, "xms", (mem_use_extended ? "true" : "false"), true);
+	DBP_Option::Apply(sec_dos, "ems", (mem_use_extended ? "true" : "false"), true);
 	DBP_Option::Apply(sec_dosbox, "memsize", (mem_use_extended ? mem : "16"), false, true, mem_changed);
 
-	const char* audiorate = DBP_Option::Get(DBP_Option::audiorate);
-	DBP_Option::Apply(sec_mixer, "rate", audiorate, false, true);
+	bool audiorate_changed = false;
+	#ifndef DBP_STANDALONE
+	const char* audiorate = DBP_Option::Get(DBP_Option::audiorate, &audiorate_changed);
+	#else
+	const char* audiorate = "44100";
+	#endif
+	DBP_Option::Apply(sec_mixer, "rate", audiorate, false, true, audiorate_changed);
 	DBP_Option::GetAndApply(sec_mixer, "swapstereo", DBP_Option::swapstereo);
+	extern bool dbp_swapstereo;
 	dbp_swapstereo = (bool)control->GetProp("mixer", "swapstereo")->GetValue(); // to also get dosbox.conf override
 
 	if (dbp_state == DBPSTATE_BOOT)
@@ -2277,6 +2328,7 @@ static bool check_variables()
 	// Emulation options
 	const char* forcefps = DBP_Option::Get(DBP_Option::forcefps);
 	dbp_forcefps = (Bit16s)(forcefps[0] == 'f' ? 0 : forcefps[0] == 't' ? 60 : atoi(forcefps));
+	if (dbp_forcefps < 0) dbp_forcefps = 0;
 
 	switch (DBP_Option::Get(DBP_Option::perfstats)[0])
 	{
@@ -2284,12 +2336,14 @@ static bool check_variables()
 		case 'd': dbp_perf = DBP_PERF_DETAILED; break;
 		default:  dbp_perf = DBP_PERF_NONE; break;
 	}
+	#ifndef DBP_STANDALONE
 	switch (DBP_Option::Get(DBP_Option::savestate)[0])
 	{
 		case 'd': dbp_serializemode = DBPSERIALIZE_DISABLED; break;
 		case 'r': dbp_serializemode = DBPSERIALIZE_REWIND; break;
 		default: dbp_serializemode = DBPSERIALIZE_STATES; break;
 	}
+	#endif
 	DBPArchive::accomodate_delta_encoding = (dbp_serializemode == DBPSERIALIZE_REWIND);
 	dbp_conf_loading = DBP_Option::Get(DBP_Option::conf)[0];
 	dbp_menu_time = (char)atoi(DBP_Option::Get(DBP_Option::menu_time));
@@ -2299,52 +2353,52 @@ static bool check_variables()
 	bool cycles_numeric = (cycles[0] >= '0' && cycles[0] <= '9');
 	int cycles_max = (cycles_numeric ? 0 : atoi(DBP_Option::Get(DBP_Option::cycles_max, &cycles_changed)));
 	DBP_Option::SetDisplay(DBP_Option::cycles_max, !cycles_numeric);
-	DBP_Option::SetDisplay(DBP_Option::cycles_scale, cycles_numeric || cycles_max);
+	DBP_Option::SetDisplay(DBP_Option::cycles_scale, cycles_numeric || cycles_max > 0);
 	DBP_Option::SetDisplay(DBP_Option::cycle_limit, !cycles_numeric);
 	if (cycles_numeric)
 	{
 		snprintf(buf, sizeof(buf), "%d", (int)(atoi(cycles) * (float)atof(DBP_Option::Get(DBP_Option::cycles_scale, &cycles_changed)) + .499));
 		cycles = buf;
 	}
-	else if (cycles_max)
+	else if (cycles_max > 0)
 	{
 		snprintf(buf, sizeof(buf), "%s limit %d", cycles, (int)(cycles_max * (float)atof(DBP_Option::Get(DBP_Option::cycles_scale, &cycles_changed)) + .499));
 		cycles = buf;
 	}
 	visibility_changed |= DBP_Option::Apply(sec_cpu, "cycles", cycles, false, false, cycles_changed);
 
-	dbp_auto_target = 1.0f * (cycles_numeric ? 1.0f : (float)atof(DBP_Option::Get(DBP_Option::cycle_limit)));
+	dbp_auto_target = (1.0f * (cycles_numeric ? 1.0f : (float)atof(DBP_Option::Get(DBP_Option::cycle_limit)))) - 0.0075f; // was - 0.01f
 
 	extern const char* RunningProgram;
-	bool cpu_code_changed = false;
-	const char* cpu_core = ((!memcmp(RunningProgram, "BOOT", 5) && DBP_Option::Get(DBP_Option::bootos_forcenormal, &cpu_code_changed)[0] == 't') ? "normal" : DBP_Option::Get(DBP_Option::cpu_core, &cpu_code_changed));
-	DBP_Option::Apply(sec_cpu, "core", cpu_core, false, false, cpu_code_changed);
+	bool cpu_core_changed = false;
+	const char* cpu_core = ((!memcmp(RunningProgram, "BOOT", 5) && DBP_Option::Get(DBP_Option::bootos_forcenormal, &cpu_core_changed)[0] == 't') ? "normal" : DBP_Option::Get(DBP_Option::cpu_core, &cpu_core_changed));
+	DBP_Option::Apply(sec_cpu, "core", cpu_core, false, false, cpu_core_changed);
 	DBP_Option::GetAndApply(sec_cpu, "cputype", DBP_Option::cpu_type, true);
 
 	DBP_Option::SetDisplay(DBP_Option::modem, dbp_use_network);
 	if (dbp_use_network)
 		DBP_Option::Apply(*control->GetSection("serial"), "serial1", ((DBP_Option::Get(DBP_Option::modem)[0] == 'n') ? "libretro null" : "libretro"));
 
-	DBP_Option::SetDisplay(DBP_Option::svga, machine_is_svga);
-	DBP_Option::SetDisplay(DBP_Option::svgamem, machine_is_svga);
-	DBP_Option::SetDisplay(DBP_Option::voodoo, machine_is_svga);
-	DBP_Option::SetDisplay(DBP_Option::voodoo_perf, machine_is_svga);
-	DBP_Option::SetDisplay(DBP_Option::voodoo_gamma, machine_is_svga);
-	DBP_Option::SetDisplay(DBP_Option::voodoo_scale, machine_is_svga);
-	if (machine_is_svga)
+	DBP_Option::SetDisplay(DBP_Option::svga, show_svga);
+	DBP_Option::SetDisplay(DBP_Option::svgamem, show_svga);
+	DBP_Option::SetDisplay(DBP_Option::voodoo, show_svga);
+	DBP_Option::SetDisplay(DBP_Option::voodoo_perf, show_svga);
+	DBP_Option::SetDisplay(DBP_Option::voodoo_gamma, show_svga);
+	DBP_Option::SetDisplay(DBP_Option::voodoo_scale, show_svga);
+	if (active_mchar == 's')
 	{
 		Section& sec_pci = *control->GetSection("pci");
 		DBP_Option::GetAndApply(sec_pci, "voodoo", DBP_Option::voodoo, true, true);
 		const char* voodoo_perf = DBP_Option::Get(DBP_Option::voodoo_perf);
-		DBP_Option::Apply(sec_pci, "voodoo_perf", (voodoo_perf[0] == 'a' ? "4" : voodoo_perf)); // "4" falls back to multi-threaded without OpenGL
+		DBP_Option::Apply(sec_pci, "voodoo_perf", ((voodoo_perf[0] == 'a' || voodoo_perf[0] == '4') ? (dbp_hw_render.context_type == RETRO_HW_CONTEXT_NONE ? "1" : "4") : voodoo_perf));
 		if (dbp_hw_render.context_type == RETRO_HW_CONTEXT_NONE && (atoi(voodoo_perf) & 0x4))
 			retro_notify(0, RETRO_LOG_WARN, "To enable OpenGL hardware rendering, close and re-open.");
 		DBP_Option::GetAndApply(sec_pci, "voodoo_gamma", DBP_Option::voodoo_gamma);
 		DBP_Option::GetAndApply(sec_pci, "voodoo_scale", DBP_Option::voodoo_scale);
 	}
 
-	DBP_Option::SetDisplay(DBP_Option::cga, machine_is_cga);
-	if (machine_is_cga)
+	DBP_Option::SetDisplay(DBP_Option::cga, show_cga);
+	if (active_mchar == 'c')
 	{
 		const char* cga = DBP_Option::Get(DBP_Option::cga);
 		bool cga_new_model = false;
@@ -2354,8 +2408,8 @@ static bool check_variables()
 		DBP_CGA_SetModelAndComposite(cga_new_model, (!cga_mode || cga_mode[0] == 'a' ? 0 : ((cga_mode[0] == 'o' && cga_mode[1] == 'n') ? 1 : 2)));
 	}
 
-	DBP_Option::SetDisplay(DBP_Option::hercules, machine_is_hercules);
-	if (machine_is_hercules)
+	DBP_Option::SetDisplay(DBP_Option::hercules, show_hercules);
+	if (active_mchar == 'h')
 	{
 		const char herc_mode = DBP_Option::Get(DBP_Option::hercules)[0];
 		DBP_Hercules_SetPalette(herc_mode == 'a' ? 1 : (herc_mode == 'g' ? 2 : 0));
@@ -2384,9 +2438,9 @@ static bool check_variables()
 
 	std::string soundfontpath;
 	if (!*midi || !strcmp(midi, "disabled") || !strcasecmp(midi, "none")) midi = "";
-	else if (strcmp(midi, "frontend") && strcmp(midi, "scan"))
+	else if (strcmp(midi, "frontend") && strcmp(midi, "scan") && strcmp(midi, "system"))
 		midi = (soundfontpath = DBP_GetSaveFile(SFT_SYSTEMDIR)).append(midi).c_str();
-	DBP_Option::Apply(sec_midi, "midiconfig", midi, false, false, midi_changed);
+	DBP_Option::Apply(sec_midi, "midiconfig", (strcmp(midi, "system") ? midi : ""), false, false, midi_changed);
 	DBP_Option::Apply(sec_midi, "mpu401", (*midi ? "intelligent" : "none"), false, false, midi_changed);
 
 	DBP_Option::GetAndApply(sec_sblaster, "sbtype",  DBP_Option::sblaster_type);
@@ -2439,7 +2493,119 @@ static void init_dosbox_load_dosboxconf(const std::string& cfg, Section*& ref_au
 	}
 }
 
-static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = false, const std::string* dbconf = NULL)
+static void init_dosbox_parse_drives()
+{
+	DBP_PadMapping::Load(); // if loaded don't show auto map notification
+
+	struct Local { static void FileIter(const char* path, bool is_dir, Bit32u size, Bit16u, Bit16u, Bit8u, Bitu data)
+	{
+		if (is_dir) return;
+		const char* lastslash = strrchr(path, '\\'), *fname = (lastslash ? lastslash + 1 : path);
+
+		// Check mountable disk images on drive C
+		const char* fext = (data == ('C'-'A') ? strrchr(fname, '.') : NULL);
+		if (fext++)
+		{
+			bool isFS = (!strcmp(fext, "ISO") || !strcmp(fext, "CHD") || !strcmp(fext, "CUE") || !strcmp(fext, "INS") || !strcmp(fext, "IMG") || !strcmp(fext, "IMA") || !strcmp(fext, "VHD") || !strcmp(fext, "JRC") || !strcmp(fext, "TC"));
+			if (isFS && !strncmp(fext, "IM", 2))
+			{
+				DOS_File *df;
+				if (size < 163840 || ((size % 512) && (size % 2352))) isFS = false; // validate generic image (disk or cd)
+				else if (size < 2949120) // validate floppy images
+				{
+					for (Bit32u i = 0, dgsz;; i++) if ((dgsz = DiskGeometryList[i].ksize * 1024) == size || dgsz + 1024 == size) goto img_is_fs;
+					isFS = false;
+					img_is_fs:;
+				}
+				else if (!Drives[data]->FileOpen(&df, (char*)path, OPEN_READ)) { DBP_ASSERT(0); isFS = false; }
+				else // validate mountable hard disk / cd
+				{
+					df->AddRef();
+					imageDisk* id = new imageDisk(df, "", (size / 1024), true);
+					if (!id->Set_GeometryForHardDisk()) isFS = DBP_IsDiskCDISO(id);
+					delete id; // closes and deletes df
+				}
+			}
+			if (isFS && !strcmp(fext, "INS"))
+			{
+				// Make sure this is an actual CUE file with an INS extension
+				Bit8u cmd[6];
+				if (size >= 16384 || DriveReadFileBytes(Drives[data], path, cmd, (Bit16u)sizeof(cmd)) != sizeof(cmd) || memcmp(cmd, "FILE \"", sizeof(cmd))) isFS = false;
+			}
+			if (isFS)
+			{
+				std::string entry;
+				entry.reserve(4 + (fext - path) + 4);
+				(entry += "$C:\\") += path; // the '$' is for FindAndOpenDosFile
+				DBP_AppendImage(entry.c_str(), true);
+			}
+		}
+
+		if (dbp_auto_mapping) return;
+		Bit32u hash = 0x811c9dc5;
+		for (const char* p = fname; *p; p++)
+			hash = ((hash * 0x01000193) ^ (Bit8u)*p);
+		hash ^= (size<<3);
+
+		for (Bit32u idx = hash;; idx++)
+		{
+			if (!map_keys[idx %= MAP_TABLE_SIZE]) break;
+			if (map_keys[idx] != hash) continue;
+
+			static std::vector<Bit8u> static_buf;
+			static std::string static_title;
+
+			const MAPBucket& idents_bk = map_buckets[idx % MAP_BUCKETS];
+
+			static_buf.resize(idents_bk.idents_size_uncompressed);
+			Bit8u* buf = &static_buf[0];
+			zipDrive::Uncompress(idents_bk.idents_compressed, idents_bk.idents_size_compressed, buf, idents_bk.idents_size_uncompressed);
+
+			const Bit8u* ident = buf + (idx / MAP_BUCKETS) * 5;
+			const MAPBucket& mappings_bk = map_buckets[ident[0] % MAP_BUCKETS];
+			const Bit16u map_offset = (ident[1]<<8) + ident[2];
+			const char* map_title = (char*)buf + (MAP_TABLE_SIZE/MAP_BUCKETS) * 5 + (ident[3]<<8) + ident[4];
+
+			dbp_content_year = (Bit16s)(1970 + (Bit8u)map_title[0]);
+			if (dbp_auto_mapping_mode == 'f')
+				return;
+
+			static_title = "Game: ";
+			static_title += map_title + 1;
+			dbp_auto_mapping_title = static_title.c_str();
+
+			static_buf.resize(mappings_bk.mappings_size_uncompressed);
+			buf = &static_buf[0];
+			zipDrive::Uncompress(mappings_bk.mappings_compressed, mappings_bk.mappings_size_compressed, buf, mappings_bk.mappings_size_uncompressed);
+
+			dbp_auto_mapping = buf + map_offset;
+			dbp_auto_mapping_names = (char*)buf + mappings_bk.mappings_action_offset;
+
+			if (dbp_auto_mapping_mode == 'n' && !dbp_custom_mapping.size()) //notify
+				retro_notify(0, RETRO_LOG_INFO, "Detected Automatic GamePad mappings for %s", static_title.c_str());
+			return;
+		}
+	}};
+
+	for (int i = 0; i != ('Z'-'A'); i++)
+		if (Drives[i])
+			DriveFileIterator(Drives[i], Local::FileIter, i);
+
+	for (size_t i = 0; i != dbp_images.size(); i++)
+	{
+		// Filter image files that have the same name as a cue file
+		const char *imgpath = dbp_images[i].path.c_str(), *imgext = imgpath + dbp_images[i].path.length() - 3;
+		if (strcmp(imgext, "CUE") && strcmp(imgext, "INS")) continue;
+		for (size_t j = dbp_images.size(); j--;)
+		{
+			if (i == j || memcmp(dbp_images[j].path.c_str(), imgpath, imgext - imgpath)) continue;
+			dbp_images.erase(dbp_images.begin() + j);
+			if (i > j) i--;
+		}
+	}
+}
+
+static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::string* dbconf = NULL)
 {
 	if (reinit)
 	{
@@ -2466,32 +2632,37 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 		for (size_t i = dbp_images.size(); i--;)
 		{
 			DBP_Image& img = dbp_images[i];
-			if (newcontent || img.imgmount) dbp_images.erase(dbp_images.begin() + i);
+			if (!dbp_wasloaded || img.imgmount) dbp_images.erase(dbp_images.begin() + i);
 			else { img.remount = img.mounted; img.mounted = false; }
 		}
 	}
 
 	const char* path = (dbp_content_path.empty() ? NULL : dbp_content_path.c_str()), *path_file, *path_ext, *path_fragment; size_t path_namelen;
-	if (path && DBP_ExtractPathInfo(path, &path_file, &path_namelen, &path_ext, &path_fragment) && dbp_content_name.empty())
+	if (path && DBP_ExtractPathInfo(path, &path_file, &path_namelen, &path_ext, &path_fragment) && !dbp_wasloaded)
+	{
 		dbp_content_name = std::string(path_file, path_namelen);
+		#ifdef DBP_STANDALONE
+		DBPS_OnContentLoad(dbp_content_name.c_str(), path, (path_file > path ? (size_t)(path_file - path - 1) : 0));
+		#endif
+	}
 	const int path_extlen = (path ? (int)((path_fragment ? path_fragment : path + dbp_content_path.length()) - path_ext) : 0);
+	const bool newcontent = !dbp_wasloaded, force_puremenu = (dbp_biosreboot || forcemenu);
+	if (newcontent) dbp_biosreboot = false; // ignore this when switching content
+	if (newcontent && !reinit) dbp_auto_mapping = NULL; // re-acquire when switching content
 
 	// Loading a .conf file behaves like regular DOSBox (no union drive mounting, save file, start menu, etc.)
-	bool skip_c_mount = (path_extlen == 4 && !strncasecmp(path_ext, "conf", 4));
-	if (newcontent) dbp_biosreboot = false; // ignore this when switching content
-	if (newcontent) dbp_auto_mapping = NULL; // re-acquire when switching content
-	const bool force_puremenu = (dbp_biosreboot || forcemenu);
-	if (skip_c_mount && !dbconf)
+	dbp_skip_c_mount = (path_extlen == 4 && !strncasecmp(path_ext, "conf", 4));
+	if (dbp_skip_c_mount && !dbconf)
 	{
 		std::string confcontent;
 		if (ReadAndClose(rawFile::TryOpen(path), confcontent))
-			return init_dosbox(newcontent, forcemenu, reinit, &confcontent);
+			return init_dosbox(forcemenu, reinit, &confcontent);
 	}
 
 	control = new Config();
 	DOSBOX_Init();
 	Section* autoexec = control->GetSection("autoexec");
-	if (dbconf) init_dosbox_load_dosboxconf(*dbconf, autoexec, force_puremenu, skip_c_mount);
+	if (dbconf) init_dosbox_load_dosboxconf(*dbconf, autoexec, force_puremenu, dbp_skip_c_mount);
 	DBP_Run::PreInit(newcontent && !reinit);
 	check_variables();
 	dbp_boot_time = time_cb();
@@ -2501,7 +2672,7 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 	PROGRAMS_MakeFile("REMOUNT.COM", DBP_PureRemountProgram);
 	PROGRAMS_MakeFile("XCOPY.COM", DBP_PureXCopyProgram);
 
-	if (!skip_c_mount)
+	if (!dbp_skip_c_mount)
 	{
 		dbp_legacy_save = false;
 		std::string save_file = DBP_GetSaveFile(SFT_GAMESAVE); // this can set dbp_legacy_save to true, needed by DBP_Mount
@@ -2529,118 +2700,7 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 	// Detect content year and auto mapping
 	if (newcontent && !reinit)
 	{
-		DBP_PadMapping::Load(); // if loaded don't show auto map notification
-
-		struct Local { static void FileIter(const char* path, bool is_dir, Bit32u size, Bit16u, Bit16u, Bit8u, Bitu data)
-		{
-			if (is_dir) return;
-			const char* lastslash = strrchr(path, '\\'), *fname = (lastslash ? lastslash + 1 : path);
-
-			// Check mountable disk images on drive C
-			const char* fext = (data == ('C'-'A') ? strrchr(fname, '.') : NULL);
-			if (fext++)
-			{
-				bool isFS = (!strcmp(fext, "ISO") || !strcmp(fext, "CHD") || !strcmp(fext, "CUE") || !strcmp(fext, "INS") || !strcmp(fext, "IMG") || !strcmp(fext, "IMA") || !strcmp(fext, "VHD") || !strcmp(fext, "JRC") || !strcmp(fext, "TC"));
-				if (isFS && !strncmp(fext, "IM", 2))
-				{
-					DOS_File *df;
-					if (size < 163840 || (size % 512)) isFS = false; // validate generic disk image
-					else if (size < 2949120) // validate floppy images
-					{
-						for (Bit32u i = 0, dgsz;; i++) if ((dgsz = DiskGeometryList[i].ksize * 1024) == size || dgsz + 1024 == size) goto img_is_fs;
-						isFS = false;
-						img_is_fs:;
-					}
-					else if (!Drives[data]->FileOpen(&df, (char*)path, OPEN_READ)) { DBP_ASSERT(0); isFS = false; }
-					else // validate mountable hard disk
-					{
-						df->AddRef();
-						imageDisk* id = new imageDisk(df, "", (size / 1024), true);
-						id->Set_GeometryForHardDisk();
-						if (!id->sector_size || !id->heads || !id->cylinders ||!id->sectors) isFS = false;
-						delete id; // closes and deletes df
-					}
-				}
-				if (isFS && !strcmp(fext, "INS"))
-				{
-					// Make sure this is an actual CUE file with an INS extension
-					Bit8u cmd[6];
-					if (size >= 16384 || DriveReadFileBytes(Drives[data], path, cmd, (Bit16u)sizeof(cmd)) != sizeof(cmd) || memcmp(cmd, "FILE \"", sizeof(cmd))) isFS = false;
-				}
-				if (isFS)
-				{
-					std::string entry;
-					entry.reserve(4 + (fext - path) + 4);
-					(entry += "$C:\\") += path; // the '$' is for FindAndOpenDosFile
-					DBP_AppendImage(entry.c_str(), true);
-				}
-			}
-
-			if (dbp_auto_mapping) return;
-			Bit32u hash = 0x811c9dc5;
-			for (const char* p = fname; *p; p++)
-				hash = ((hash * 0x01000193) ^ (Bit8u)*p);
-			hash ^= (size<<3);
-
-			for (Bit32u idx = hash;; idx++)
-			{
-				if (!map_keys[idx %= MAP_TABLE_SIZE]) break;
-				if (map_keys[idx] != hash) continue;
-
-				static std::vector<Bit8u> static_buf;
-				static std::string static_title;
-
-				const MAPBucket& idents_bk = map_buckets[idx % MAP_BUCKETS];
-
-				static_buf.resize(idents_bk.idents_size_uncompressed);
-				Bit8u* buf = &static_buf[0];
-				zipDrive::Uncompress(idents_bk.idents_compressed, idents_bk.idents_size_compressed, buf, idents_bk.idents_size_uncompressed);
-
-				const Bit8u* ident = buf + (idx / MAP_BUCKETS) * 5;
-				const MAPBucket& mappings_bk = map_buckets[ident[0] % MAP_BUCKETS];
-				const Bit16u map_offset = (ident[1]<<8) + ident[2];
-				const char* map_title = (char*)buf + (MAP_TABLE_SIZE/MAP_BUCKETS) * 5 + (ident[3]<<8) + ident[4];
-
-				dbp_content_year = (Bit16s)(1970 + (Bit8u)map_title[0]);
-				if (dbp_auto_mapping_mode == 'f')
-					return;
-
-				static_title = "Game: ";
-				static_title += map_title + 1;
-				dbp_auto_mapping_title = static_title.c_str();
-
-				static_buf.resize(mappings_bk.mappings_size_uncompressed);
-				buf = &static_buf[0];
-				zipDrive::Uncompress(mappings_bk.mappings_compressed, mappings_bk.mappings_size_compressed, buf, mappings_bk.mappings_size_uncompressed);
-
-				dbp_auto_mapping = buf + map_offset;
-				dbp_auto_mapping_names = (char*)buf + mappings_bk.mappings_action_offset;
-
-				if (dbp_auto_mapping_mode == 'n' && !dbp_custom_mapping.size()) //notify
-					retro_notify(0, RETRO_LOG_INFO, "Detected Automatic Key %s", static_title.c_str());
-				return;
-			}
-		}};
-
-		for (int i = 0; i != ('Z'-'A'); i++)
-			if (Drives[i])
-				DriveFileIterator(Drives[i], Local::FileIter, i);
-
-		if (dbp_images.size())
-		{
-			for (size_t i = 0; i != dbp_images.size(); i++)
-			{
-				// Filter image files that have the same name as a cue file
-				const char *imgpath = dbp_images[i].path.c_str(), *imgext = imgpath + dbp_images[i].path.length() - 3;
-				if (strcmp(imgext, "CUE") && strcmp(imgext, "INS")) continue;
-				for (size_t j = dbp_images.size(); j--;)
-				{
-					if (i == j || memcmp(dbp_images[j].path.c_str(), imgpath, imgext - imgpath)) continue;
-					dbp_images.erase(dbp_images.begin() + j);
-					if (i > j) i--;
-				}
-			}
-		}
+		init_dosbox_parse_drives();
 
 		if (!dbp_content_year && path)
 		{
@@ -2656,10 +2716,10 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 
 		// Check if DOS.YML needs a reboot (after evaluating dbp_images)
 		if (DBP_Run::PostInitFirstTime())
-			return init_dosbox(newcontent, forcemenu, true, dbconf);
+			return init_dosbox(forcemenu, true, dbconf);
 	}
 
-	if (DOS_Drive* drive_c = Drives['C'-'A']) // guaranteed not NULL unless skip_c_mount
+	if (DOS_Drive* drive_c = Drives['C'-'A']) // guaranteed not NULL unless dbp_skip_c_mount
 	{
 		if (dbp_conf_loading != 'f' && !reinit && !dbconf)
 		{
@@ -2674,7 +2734,7 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 				conffile = rawFile::TryOpen(strconfpath.assign(path, path_ext - path).append(path_ext[-1] == '.' ? 0 : 1, '.').append("conf").c_str());
 			}
 			if (conffile && ReadAndClose(conffile, confcontent))
-				return init_dosbox(newcontent, forcemenu, true, &confcontent);
+				return init_dosbox(forcemenu, true, &confcontent);
 		}
 
 		// Try to load either DOSBOX.SF2 or a pair of MT32_CONTROL.ROM/MT32_PCM.ROM from the mounted C: drive and use as fixed midi config
@@ -2698,11 +2758,11 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 
 	// Always switch to the C: drive directly (for puremenu, to run DOSBOX.BAT and to run the autoexec of the dosbox conf)
 	// For DBP we modified init_line to always run Z:\AUTOEXEC.BAT and not just any AUTOEXEC.BAT of the current drive/directory
-	if (DOS_SetDrive('C'-'A') && autoexec) // SetDrive will fail if skip_c_mount
+	if (DOS_SetDrive('C'-'A') && autoexec) // SetDrive will fail if dbp_skip_c_mount
 	{
 		bool auto_mount = true;
 		autoexec->ExecuteDestroy();
-		if (!force_puremenu && dbp_menu_time != (char)-1 && path_extlen == 3 && (!strncasecmp(path_ext, "EXE", 3) || !strncasecmp(path_ext, "COM", 3) || !strncasecmp(path_ext, "BAT", 3)) && !Drives['C'-'A']->FileExists("AUTOBOOT.DBP"))
+		if (!force_puremenu && dbp_menu_time != (signed char)-1 && path_extlen == 3 && (!strncasecmp(path_ext, "EXE", 3) || !strncasecmp(path_ext, "COM", 3) || !strncasecmp(path_ext, "BAT", 3)) && !Drives['C'-'A']->FileExists("AUTOBOOT.DBP"))
 		{
 			((((((static_cast<Section_line*>(autoexec)->data += "echo off") += '\n') += ((path_ext[0]|0x20) == 'b' ? "call " : "")) += path_file) += '\n') += "Z:PUREMENU") += " -FINISH\n";
 		}
@@ -2728,6 +2788,7 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 		if (!newcontent) dbp_image_index = (active_disk_image_index >= dbp_images.size() ? 0 : active_disk_image_index);
 	}
 	dbp_biosreboot = dbp_reboot_set64mem = false;
+	dbp_wasloaded = true;
 	DBP_ReportCoreMemoryMaps();
 
 	// Clear any dos errors that could have been set by drive file access until now
@@ -2745,6 +2806,9 @@ static void init_dosbox(bool newcontent, bool forcemenu = false, bool reinit = f
 	dbp_state = DBPSTATE_FIRST_FRAME;
 	Thread::StartDetached(Local::ThreadDOSBox);
 }
+
+// This is called on the main thread
+void DBP_ForceReset(bool forcemenu) { init_dosbox(forcemenu); } 
 
 void retro_init(void) //#3
 {
@@ -2938,6 +3002,7 @@ void retro_init(void) //#3
 
 bool retro_load_game(const struct retro_game_info *info) //#4
 {
+	#ifndef DBP_STANDALONE
 	enum retro_pixel_format pixel_format = RETRO_PIXEL_FORMAT_XRGB8888;
 	if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixel_format))
 	{
@@ -2946,9 +3011,12 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 	}
 
 	const char* voodoo_perf = DBP_Option::Get(DBP_Option::voodoo_perf);
+	#else
+	const char* voodoo_perf = "auto"; // standalone always uses OpenGL rendering
+	#endif
 	if (voodoo_perf[0] == 'a' || voodoo_perf[0] == '4') // 3dfx wants to use OpenGL, request hardware render context
 	{
-		static struct sglproc { retro_proc_address_t& ptr; const char* name; bool required; } glprocs[] = { MYGL_FOR_EACH_PROC(MYGL_MAKEPROCARRENTRY) };
+		static struct sglproc { retro_proc_address_t* ptr; const char* name; bool required; } glprocs[] = { MYGL_FOR_EACH_PROC(MYGL_MAKEPROCARRENTRY) };
 		static unsigned prog_dosboxbuffer, vbo, vao, tex, fbo, lastw, lasth;
 
 		static const Bit8u testhwcontexts[] = { RETRO_HW_CONTEXT_OPENGL_CORE, RETRO_HW_CONTEXT_OPENGLES_VERSION, RETRO_HW_CONTEXT_OPENGLES3, RETRO_HW_CONTEXT_OPENGLES2, RETRO_HW_CONTEXT_OPENGL };
@@ -2959,20 +3027,20 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 				bool missRequired = false;
 				for (sglproc& glproc : glprocs)
 				{
-					glproc.ptr = dbp_hw_render.get_proc_address(glproc.name);
-					if (!glproc.ptr)
+					*glproc.ptr = dbp_hw_render.get_proc_address(glproc.name);
+					if (!*glproc.ptr)
 					{
 						//GFX_ShowMsg("[DBP:GL] OpenGL Function %s is not available!", glproc.name);
 						char buf[256], *arboes = buf + strlen(glproc.name);
 						memcpy(buf, glproc.name, (arboes - buf));
 						memcpy(arboes, "ARB", 4);
-						glproc.ptr = dbp_hw_render.get_proc_address(buf);
-						if (!glproc.ptr)
+						*glproc.ptr = dbp_hw_render.get_proc_address(buf);
+						if (!*glproc.ptr)
 						{
 							//GFX_ShowMsg("[DBP:GL] OpenGL Function %s is not available!", buf);
 							memcpy(arboes, "OES", 4);
-							glproc.ptr = dbp_hw_render.get_proc_address(buf);
-							if (!glproc.ptr)
+							*glproc.ptr = dbp_hw_render.get_proc_address(buf);
+							if (!*glproc.ptr)
 							{
 								GFX_ShowMsg("[DBP:GL] %s OpenGL Function %s is not available!", (glproc.required ? "Required" : "Optional"), glproc.name);
 								if (glproc.required) { DBP_ASSERT(0); missRequired = true; }
@@ -3018,6 +3086,7 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 					"}";
 
 				static const char* bind_attrs[] = { "a_position", "a_texcoord" };
+				if (myglGetError()) { DBP_ASSERT(0); goto gl_error; }
 				prog_dosboxbuffer = DBP_Build_GL_Program(1, &vertex_shader_src, 1, &fragment_shader_src, 2, bind_attrs);
 				if (myglGetError()) { DBP_ASSERT(0); goto gl_error; }
 
@@ -3103,7 +3172,11 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 				if (is_voodoo_display)
 					myglDrawArrays(MYGL_TRIANGLE_STRIP, 4, 4);
 
+				#ifndef DBP_STANDALONE
 				if (!is_voodoo_display || dbp_intercept_next)
+				#else
+				if (!is_voodoo_display)
+				#endif
 				{
 					myglBindTexture(MYGL_TEXTURE_2D, tex);
 					myglTexSubImage2D(MYGL_TEXTURE_2D, 0, 0, 0, buf.width, buf.height, MYGL_RGBA, MYGL_UNSIGNED_BYTE, buf.video);
@@ -3129,7 +3202,7 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 			}
 		};
 
-		for (int test = -1; test != (voodoo_perf[0] == 'a' ? 0 : 5); test++)
+		for (int test = -1, testmax = (voodoo_perf[0] == 'a' ? 0 : 5); test != testmax; test++)
 		{
 			if (test < 0)
 			{
@@ -3137,6 +3210,9 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 				if (!environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preffered_hw_render)) continue;
 				if (preffered_hw_render == RETRO_HW_CONTEXT_NONE || preffered_hw_render >= RETRO_HW_CONTEXT_VULKAN) continue;
 				dbp_hw_render.context_type = (enum retro_hw_context_type)preffered_hw_render;
+				// RetroArch on Android will return RETRO_HW_CONTEXT_OPENGL even when only accepting a OPENGLES context.
+				// So we still try all the other tests in that case even when on auto.
+				if (preffered_hw_render == RETRO_HW_CONTEXT_OPENGL) testmax = 4;
 			}
 			else dbp_hw_render.context_type = (enum retro_hw_context_type)testhwcontexts[test];
 			dbp_hw_render.version_major = (dbp_hw_render.context_type >= RETRO_HW_CONTEXT_OPENGL_CORE ? 3 : 0);
@@ -3177,7 +3253,7 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 	//bool use_audio_callback = environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK, (void*)&rac);
 
 	if (info && info->path && *info->path) dbp_content_path = info->path;
-	init_dosbox(true);
+	init_dosbox();
 
 	bool support_achievements = true;
 	environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &support_achievements);
@@ -3229,7 +3305,7 @@ void retro_set_controller_port_device(unsigned port, unsigned device) //#5
 void retro_reset(void)
 {
 	// Calling input_state_cb before the first frame can be fatal (RetroArch would crash), but during retro_reset it should be fine
-	init_dosbox(dbp_content_name.empty(), input_state_cb && (
+	init_dosbox(input_state_cb && (
 		input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_LSHIFT) ||
 		input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_RSHIFT) ||
 		input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2) ||
@@ -3281,62 +3357,17 @@ void retro_run(void)
 	#ifdef DBP_ENABLE_FPS_COUNTERS
 	DBP_FPSCOUNT(dbp_fpscount_retro)
 	uint32_t curTick = DBP_GetTicks();
-	if (curTick - dbp_lastfpstick >= 1000)
+	if (curTick - dbp_lastfpstick >= 1000 && !dbp_perf)
 	{
 		double fpsf = 1000.0 / (double)(curTick - dbp_lastfpstick), gfxf = fpsf * (render.frameskip.max < 1 ? 1 : render.frameskip.max);
 		log_cb(RETRO_LOG_INFO, "[DBP FPS] RETRO: %3.2f - GFXSTART: %3.2f - GFXEND: %3.2f - EVENT: %5.1f - EMULATED: %3.2f - CyclesMax: %d\n",
 			dbp_fpscount_retro * fpsf, dbp_fpscount_gfxstart * gfxf, dbp_fpscount_gfxend * gfxf, dbp_fpscount_event * fpsf, render.src.fps, CPU_CycleMax);
 		dbp_lastfpstick = (curTick - dbp_lastfpstick >= 1500 ? curTick : dbp_lastfpstick + 1000);
-		dbp_fpscount_retro = dbp_fpscount_gfxstart = dbp_fpscount_gfxend = dbp_fpscount_event = 0;
+		dbp_fpscount_retro = dbp_fpscount_gfxstart = dbp_fpscount_gfxend = dbp_fpscount_event = dbp_fpscount_skip_run = dbp_fpscount_skip_render = 0;
 	}
 	#endif
 
 	if (dbp_message_queue) run_emuthread_notify();
-
-	if (dbp_state < DBPSTATE_RUNNING)
-	{
-		if (dbp_state == DBPSTATE_EXITED || dbp_state == DBPSTATE_SHUTDOWN || dbp_state == DBPSTATE_REBOOT)
-		{
-			DBP_Buffer& buf = dbp_buffers[buffer_active];
-			if (!dbp_crash_message.empty()) // unexpected shutdown
-				DBP_Shutdown();
-			else if (dbp_state == DBPSTATE_REBOOT || dbp_biosreboot)
-				DBP_ForceReset();
-			else if (dbp_state == DBPSTATE_EXITED) // expected shutdown
-			{
-				// On statically linked platforms shutdown would exit the frontend, so don't do that. Just tint the screen red and sleep
-				#ifndef STATIC_LINKING
-				if (dbp_menu_time >= 0 && dbp_menu_time < 99) // only auto shut down for users that want auto shut down in general
-				{
-					environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, 0);
-				}
-				else
-				#endif
-				{
-					for (Bit8u *p = (Bit8u*)buf.video, *pEnd = p + buf.width * buf.height * 4; p < pEnd; p += 56) p[2] = 255;
-					retro_sleep(10);
-				}
-			}
-
-			// submit last frame
-			Bit32u numEmptySamples = (Bit32u)(av_info.timing.sample_rate / av_info.timing.fps);
-			memset(dbp_audio, 0, numEmptySamples * 4);
-			audio_batch_cb(dbp_audio, numEmptySamples);
-			if (dbp_opengl_draw)
-				dbp_opengl_draw(buf);
-			else
-				video_cb(buf.video, buf.width, buf.height, buf.width * 4);
-			return;
-		}
-
-		DBP_ASSERT(dbp_state == DBPSTATE_FIRST_FRAME);
-		DBP_ThreadControl(TCM_FINISH_FRAME);
-		DBP_ASSERT(dbp_state == DBPSTATE_FIRST_FRAME || (dbp_state == DBPSTATE_EXITED && (dbp_biosreboot || dbp_crash_message.size())));
-		const char* midiarg, *midierr = DBP_MIDI_StartupError(control->GetSection("midi"), midiarg);
-		if (midierr) retro_notify(0, RETRO_LOG_ERROR, midierr, midiarg);
-		if (dbp_state == DBPSTATE_FIRST_FRAME)
-			dbp_state = DBPSTATE_RUNNING;
-	}
 
 	if (!environ_cb(RETRO_ENVIRONMENT_GET_THROTTLE_STATE, &dbp_throttle))
 	{
@@ -3367,8 +3398,8 @@ void retro_run(void)
 	}
 
 	bool variable_update = false;
-	if (!dbp_optionsupdatecallback && environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &variable_update) && variable_update)
-		check_variables();
+	if (!dbp_optionsupdatecallback && control && environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &variable_update) && variable_update)
+		check_variables(); // can't do this while DOS has crashed (control is NULL)
 
 	// start input update
 	input_poll_cb();
@@ -3433,6 +3464,81 @@ void retro_run(void)
 	if (dbp_keys_down_count)
 		DBP_ReleaseKeyEvents(true);
 
+	if (dbp_state < DBPSTATE_RUNNING)
+	{
+		if (dbp_state == DBPSTATE_EXITED || dbp_state == DBPSTATE_SHUTDOWN || dbp_state == DBPSTATE_REBOOT)
+		{
+			DBP_Buffer& buf = dbp_buffers[buffer_active];
+			if (!dbp_crash_message.empty()) // unexpected shutdown
+				DBP_Shutdown();
+			else if (dbp_state == DBPSTATE_REBOOT || dbp_biosreboot)
+				DBP_ForceReset();
+			else if (dbp_state == DBPSTATE_EXITED) // expected shutdown
+			{
+				// On statically linked platforms shutdown would exit the frontend, so don't do that. Just tint the screen red and sleep
+				#ifndef STATIC_LINKING
+				if (dbp_menu_time >= 0 && dbp_menu_time < 99) // only auto shut down for users that want auto shut down in general
+				{
+					environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, 0);
+				}
+				else
+				#endif
+				{
+					for (Bit8u *p = (Bit8u*)buf.video, *pEnd = p + buf.width * buf.height * 4; p < pEnd; p += 56) p[2] = 255;
+					retro_sleep(10);
+				}
+			}
+			else if (dbp_state == DBPSTATE_SHUTDOWN)
+			{
+				if (DBP_OSD.ptr._all == NULL) DBP_StartOSD(_DBPOSD_OPEN);
+				while (dbp_intercept_next && dbp_event_queue_read_cursor != dbp_event_queue_write_cursor)
+				{
+					DBP_Event e = dbp_event_queue[dbp_event_queue_read_cursor];
+					dbp_event_queue_read_cursor = ((dbp_event_queue_read_cursor + 1) % DBP_EVENT_QUEUE_SIZE);
+					dbp_intercept_next->evnt(e.type, e.val, e.val2);
+				}
+				if (dbp_intercept_next)
+				{
+					#ifndef DBP_STANDALONE
+					dbp_intercept_next->gfx(buf);
+					#else
+					DBP_Buffer& osdbf = dbp_osdbuf[(buffer_active + 1) % 3];
+					if (!osdbf.video) osdbf.video = (Bit32u*)malloc(DBPS_OSD_WIDTH*DBPS_OSD_HEIGHT*4);
+					memset(osdbf.video, 0, DBPS_OSD_WIDTH*DBPS_OSD_HEIGHT*4);
+					dbp_intercept_next->gfx(osdbf);
+					DBPS_SubmitOSDFrame(osdbf.video, osdbf.width, osdbf.height);
+					#endif
+				}
+			}
+
+			// submit last frame
+			#ifndef DBP_STANDALONE
+			Bit32u numEmptySamples = (Bit32u)(av_info.timing.sample_rate / av_info.timing.fps);
+			DBP_Audio& aud = dbp_audio[dbp_audio_active ^= 1];
+			if (numEmptySamples > aud.length) { aud.audio = (int16_t*)realloc(aud.audio, numEmptySamples * 4); aud.length = numEmptySamples; }
+			memset(aud.audio, 0, numEmptySamples * 4);
+			audio_batch_cb(aud.audio, numEmptySamples);
+			#endif
+			if (dbp_opengl_draw)
+				dbp_opengl_draw(buf);
+			else
+				video_cb(buf.video, buf.width, buf.height, buf.width * 4);
+			return;
+		}
+
+		DBP_ASSERT(dbp_state == DBPSTATE_FIRST_FRAME);
+		DBP_ThreadControl(TCM_FINISH_FRAME);
+		DBP_ASSERT(dbp_state == DBPSTATE_FIRST_FRAME || (dbp_state == DBPSTATE_EXITED && (dbp_biosreboot || dbp_crash_message.size())));
+		const char* midiarg, *midierr = DBP_MIDI_StartupError(control->GetSection("midi"), midiarg);
+		if (midierr) retro_notify(0, RETRO_LOG_ERROR, midierr, midiarg);
+		if (dbp_state == DBPSTATE_FIRST_FRAME) dbp_state = DBPSTATE_RUNNING;
+		if (dbp_skip_c_mount)
+		{
+			init_dosbox_parse_drives(); // parse things mounted by autoexec of .conf
+			if (dbp_auto_mapping || dbp_custom_mapping.size()) DBP_PadMapping::SetInputDescriptors(true); // refresh if now loaded
+		}
+	}
+
 	bool skip_emulate = (fpsboost > 1 && (((fpsboost_count++)%fpsboost)!=0)) || DBP_NeedFrameSkip(false);
 	DBP_ThreadControl(skip_emulate ? TCM_PAUSE_FRAME : TCM_FINISH_FRAME);
 
@@ -3452,6 +3558,7 @@ void retro_run(void)
 		dbp_perf_uniquedraw = dbp_perf_count = dbp_perf_totaltime = 0;
 	}
 
+	#ifndef DBP_STANDALONE
 	// mix audio
 	Bit32u haveSamples = DBP_MIXER_DoneSamplesCount(), mixSamples = 0; double numSamples;
 	if (dbp_throttle.mode == RETRO_THROTTLE_FAST_FORWARD && dbp_throttle.rate < 1)
@@ -3461,13 +3568,15 @@ void retro_run(void)
 	else
 		numSamples = (av_info.timing.sample_rate / dbp_throttle.rate) + dbp_audio_remain;
 	if (fpsboost > 1) numSamples /= (fpsboost*.9); // Without *.9 audio can end up skipping
-	if (numSamples && haveSamples > numSamples * .99 && dbp_audio_remain != -1) // Allow 1 percent stretch on underrun
+	if (numSamples && haveSamples && dbp_audio_remain != -1) // stretch on underrun (allows frontend to catch up with the emulation)
 	{
 		mixSamples = (numSamples > haveSamples ? haveSamples : (Bit32u)numSamples);
 		dbp_audio_remain = ((numSamples <= mixSamples || numSamples > haveSamples) ? 0.0 : (numSamples - mixSamples));
-		if (mixSamples > DBP_MAX_SAMPLES) mixSamples = DBP_MAX_SAMPLES;
-		MIXER_CallBack(0, (Bit8u*)dbp_audio, mixSamples * 4);
+		DBP_Audio& aud = dbp_audio[dbp_audio_active ^= 1];
+		if (mixSamples > aud.length) { aud.audio = (int16_t*)realloc(aud.audio, mixSamples * 4); aud.length = mixSamples; }
+		MIXER_CallBack(0, (Bit8u*)aud.audio, mixSamples * 4);
 	}
+	#endif
 
 	// Read buffer_active before waking up emulation thread
 	const DBP_Buffer& buf = dbp_buffers[buffer_active];
@@ -3477,13 +3586,12 @@ void retro_run(void)
 
 	DBP_ThreadControl(skip_emulate ? TCM_RESUME_FRAME : TCM_NEXT_FRAME);
 
+	#ifndef DBP_STANDALONE
 	// submit audio
 	//log_cb(RETRO_LOG_INFO, "[retro_run] Submit %d samples (remain %f) - Had: %d - Left: %d\n", mixSamples, dbp_audio_remain, haveSamples, DBP_MIXER_DoneSamplesCount());
 	if (mixSamples)
-	{
-		if (dbp_swapstereo) for (int16_t *p = dbp_audio, *pEnd = p + mixSamples*2; p != pEnd; p += 2) std::swap(p[0], p[1]);
-		audio_batch_cb(dbp_audio, mixSamples);
-	}
+		audio_batch_cb(dbp_audio[dbp_audio_active].audio, mixSamples);
+	#endif
 
 	if (tpfActual)
 	{
@@ -3493,14 +3601,23 @@ void retro_run(void)
 				#ifdef DBP_ENABLE_WAITSTATS
 				", Waits: p%u|f%u|z%u|c%u"
 				#endif
+				#ifdef DBP_ENABLE_FPS_COUNTERS
+				"\nRetro: %u, GfxStart: %u, GfxEnd: %u, Event: %u, SkipRun: %u, SkipRender: %u"
+				#endif
 				, ((float)tpfTarget / (float)tpfActual * 100), (int)render.src.width, (int)render.src.height, render.src.fps, (1000000.f / tpfActual), tpfDraws, CPU_CycleMax, DBP_CPU_GetDecoderName()
 				#ifdef DBP_ENABLE_WAITSTATS
 				, waitPause, waitFinish, waitPaused, waitContinue
+				#endif
+				#ifdef DBP_ENABLE_FPS_COUNTERS
+				, dbp_fpscount_retro, dbp_fpscount_gfxstart, dbp_fpscount_gfxend, dbp_fpscount_event, dbp_fpscount_skip_run, dbp_fpscount_skip_render
 				#endif
 				);
 		else
 			retro_notify(-1500, RETRO_LOG_INFO, "Emulation Speed: %4.1f%%",
 				((float)tpfTarget / (float)tpfActual * 100));
+		#ifdef DBP_ENABLE_FPS_COUNTERS
+		dbp_fpscount_retro = dbp_fpscount_gfxstart = dbp_fpscount_gfxend = dbp_fpscount_event = dbp_fpscount_skip_run = dbp_fpscount_skip_render = 0;
+		#endif
 	}
 
 	// handle video mode changes
@@ -3538,6 +3655,14 @@ void retro_run(void)
 		dbp_opengl_draw(buf);
 	else
 		video_cb(buf.video, view_width, view_height, view_width * 4);
+
+	#ifdef DBP_STANDALONE
+	if (dbp_intercept && dbp_osdbuf[&buf - dbp_buffers].video)
+	{
+		DBP_Buffer& osdbf = dbp_osdbuf[&buf - dbp_buffers];
+		DBPS_SubmitOSDFrame(osdbf.video, osdbf.width, osdbf.height);
+	}
+	#endif
 }
 
 static bool retro_serialize_all(DBPArchive& ar, bool unlock_thread)

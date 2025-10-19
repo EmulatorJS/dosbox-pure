@@ -349,7 +349,7 @@ struct DBP_Run
 		}
 
 		const Property* bootImgMachine = ((mode == RUN_BOOTIMG) ? control->GetProp("dosbox", "machine") : NULL);
-		if (startup.reboot || dbp_game_running || (from_osd && first_shell->bf && !first_shell->bf->IsAutoexec()) || (bootImgMachine && info && info != *(const char*)bootImgMachine->GetValue()))
+		if (startup.reboot || dbp_game_running || !control || (from_osd && first_shell->bf && !first_shell->bf->IsAutoexec()) || (bootImgMachine && info && info != *(const char*)bootImgMachine->GetValue()))
 		{
 			startup.reboot = false;
 			if (bootImgMachine) dbp_reboot_machine = (info ? (char)info : *(const char*)bootImgMachine->GetValue());
@@ -482,8 +482,8 @@ struct DBP_Run
 					{
 						int imgidx = -1;
 						for (DBP_Image& i : dbp_images)
-							if ((i.path.size() == 4+(ValX - Val) && i.path[0] == '$' && !strncasecmp(&i.path[4], Val, (ValX - Val)))
-								|| (i.longpath.size() == (ValX - Val) &&  !strncasecmp(&i.longpath[0], Val, (ValX - Val))))
+							if ((i.path.size() == (size_t)(4+(ValX - Val)) && i.path[0] == '$' && !strncasecmp(&i.path[4], Val, (ValX - Val)))
+								|| (i.longpath.size() == (size_t)(ValX - Val) &&  !strncasecmp(&i.longpath[0], Val, (ValX - Val))))
 								{ imgidx = (int)(&i - &dbp_images[0]); break; }
 						if (imgidx == -1) return false;
 						dbp_images[imgidx].remount = true;
@@ -764,7 +764,6 @@ struct DBP_Run
 			if (cmd[0] != '(' || cmd[1] == '(')
 			{
 				if (!(cmd[0] != '(')) cmdNext++; // Treat (( as textinput (
-				KBD_KEYS mappedkey = KBD_NONE;
 				char DBP_DOS_KeyboardLayout_MapChar(char c, bool& bShift, bool& bAltGr);
 				switch ((tmp = DBP_DOS_KeyboardLayout_MapChar(cmd[0], bShift, bAltGr)))
 				{
